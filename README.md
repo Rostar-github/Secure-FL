@@ -48,6 +48,108 @@
 
 ![](assets/GAN_info_leakage_res.png)
 
+### 恶意服务端攻击
+
+#### Gradient Information leakage from Malicious Server
+
+##### Deep Leakage from Gradient[11]
+
+在联邦学习过程中如果不对客户端上传的梯度保护（加密或加扰），那么服务器可以获得每一个客户端的经过若干个 local epoch 之后得到的模型权重或梯度，其中 local epoch 受非独立同分布影响一般不会设置很大可以是一个或几个 batch 。利用明文梯度和上一轮训练的模型，服务端尝试推理出本轮客户端产生该梯度的训练数据。
+
+假设 local epoch = 1 batch，在$t$轮，客户端节点$i$从数据集采样 mini-batch $(x_{t,i},y_{t,i})$，计算 local batch 的梯度（batch 内的样本的梯度平均值）:
+
+$$
+\nabla W_{t, i}=\frac{\partial \ell\left(F\left(\mathbf{x}_{t, i}, W_t\right), \mathbf{y}_{t, i}\right)}{\partial W_t}
+$$
+
+Global epoch 全局优化可以表示为：
+
+$$
+\nabla W_t=\frac{1}{N} \sum_j^N \nabla W_{t, j} ; \quad W_{t+1}=W_t-\eta \nabla W_t
+$$
+
+$t$表示轮数，$j$表示客户端节点。
+
+为了能利用梯度信息，服务端首先生成随机噪声作为数据和标签（$dummy$ $data$ $x^{\prime}$，$dummy$ $label$ $y^{\prime}$）,通过上一轮训练的模型计算得到 $dummy$ $gradient$:
+
+$$
+\nabla W^{\prime}=\frac{\partial \ell\left(F\left(\mathbf{x}^{\prime}, W\right), \mathbf{y}^{\prime}\right)}{\partial W}
+$$
+
+计算 $\nabla W^{\prime}$ 与 $\nabla W$ 差距反向优化（$x^{\prime}$，$y^{\prime}$）:
+
+$$
+\mathbf{x}^{\prime *}, \mathbf{y}^{\prime *}=\underset{\mathbf{x}^{\prime}, \mathbf{y}^{\prime}}{\arg \min }\left\|\nabla W^{\prime}-\nabla W\right\|^2=\underset{\mathbf{x}^{\prime}, \mathbf{y}^{\prime}}{\arg \min }\left\|\frac{\partial \ell\left(F\left(\mathbf{x}^{\prime}, W\right), \mathbf{y}^{\prime}\right)}{\partial W}-\nabla W\right\|^2
+$$
+
+优化方法采用基于梯度下降的优化方法，单步优化空间为 shape of（$x^{\prime}$，$y^{\prime}$），算法表示：
+
+![DLG.png](./assets/DLG.png)
+
+流程图表示：
+
+![DLG_fig.png](./assets/DLG_fig.png)
+
+上述过程是在 batch size 为 1 的情况下的表示（FedSGD，batch size = 1），在 batch size 大于 1 时，服务端从标准正态分布中分别采样 batch size 个 （$dummy$ $data$ $x^{\prime}$，$dummy$ $label$ $y^{\prime}$）分别单独执行上述算法，优化第一个（$x^{\prime}$，$y^{\prime}$）若干轮后优化第二个。总的优化目标还是使 $\nabla W^{\prime}$ 与 $\nabla W$ 接近。
+
+算法效果：（MNIST，CIFAR-100，SVHN，LFW）
+
+![](assets/DLG_fig_exp.png)
+
+**存在的问题：** 当 batch size 很大时优化空间维度很大，基于梯度下降的优化方法难以应对。从优化过程上看优化 dummy data 与 dummy label 是单独进行的分别优化边缘分布 $P(x)$, $P(y)$，然而实际上需要优化的过程是从标准正态分布到联合分布 $P(x,y)$，因此优化过程无视了部分 $x$ 与 $y$ 之间的相关信息，导致生成的标签与数据不匹配。
+
+##### iDLG: Improved Deep Leakage from Gradients[12]
+
+DLG存在的问题之一是生成的标签与数据不对应，iDLG提出一种能够以 100% 准确率提取 batch size = 1 情况下的训练数据标签。在提取出正确标签的情况下，优化变量只有 dummy data 这样从多变量优化到单变量优化使准确度提高很多。
+
+iDLG攻击针对任意存在全连接层且激活函数导数大于0（Sigmoid，ReLU）的分类模型。
+
+深度学习中的分类任务主要使用交叉熵函数（Cross-entropy Loss），类别标签为 one-hot 编码，数据 $x$ 对应的类别 $c$ （ground-truth）对应的交叉熵损失为：
+
+$$
+l(\mathbf{x}, c)=-\log \frac{e^{y_c}}{\Sigma_j e^{y_j}}
+$$
+
+设 SoftMax 层输出的类别概率为 $Y=[y_1,y_2,...]$，$y_i$为对应类别 $i$ 模型预测的置信度（概率），$y_i$ 关于交叉熵损失函数的导数为:
+
+$$
+\begin{aligned}
+g_i=\frac{\partial l(\mathbf{x}, c)}{\partial y_i}&=-\frac{\partial \log e^{y_c}-\partial \log \Sigma_j e^{y_j}}{\partial y_i}
+\\
+&=\left\{\begin{array}{cl}
+-1+\frac{e^{y_i}}{\Sigma_j e^{y_j}}, & \text { if } i=c \\
+\frac{e^{y_i}}{\Sigma_j e^{y_j}}, & \text { else }
+\end{array}\right.
+
+\end{aligned}
+$$
+
+其中$\frac{e^{y_i}}{\Sigma_j e^{y_j}} \in (0,1)$，当 $i=c$ 时 $g_i \in (-1,0)$ ，当$i \neq c $ 时 $g_i \in (0,1)$。所以 ground-truth 就是关于损失函数的梯度为负数的输出对应的下标，但在训练过中只能获得模型的梯度 $\nabla W$，不能获得 $g_i$。因此在后向传播求导链上回溯分析，设产生输出 $y_i$ 全连接层参数为 $W^{i}_{L}$， 它的梯度 $\nabla W^{i}_{L}$ 为:
+
+$$
+\begin{aligned}
+\nabla \mathbf{W}_L^i=\frac{\partial l(\mathbf{x}, c)}{\partial \mathbf{W}_L^i} &=\frac{\partial l(\mathbf{x}, c)}{\partial y_i} \cdot \frac{\partial y_i}{\partial \mathbf{W}_L^i} \cdot \delta \\
+&=g_i \cdot \frac{\partial\left(\mathbf{W}_L^{i T} \mathbf{a}_{L-1}+b_L^i\right)}{\partial \mathbf{W}_L^i} \cdot \delta \\
+&=g_i \cdot \mathbf{a}_{L-1} \cdot \delta,
+\end{aligned}
+$$
+
+其中 $\mathbf{a}_{L-1}$ 是上层输出即本层输入 $\delta$ 为激活函数导数，由于在激活函数 Sigmoid 或 ReLU 的作用下上层输出一定大于 0 ，因此对 $g_i$ 的符号分析传递至 $\nabla \mathbf{W}_L^i$ ，只需要 ground-truth 对应位置的梯度与其他位置梯度异号即可判断训练样本真实标签。
+
+$$
+c=i, \quad \text { s.t. } \quad \nabla \mathbf{W}_L^{i T} \cdot \nabla \mathbf{W}_L^j \leq 0, \quad \forall j \neq i
+$$
+
+算法对应流程：
+
+![](assets/iDLG.png)
+
+**存在问题：** 判断标签只能在 batch size = 1 的条件下进行。
+
+##### See through Gradients: Image Batch Recovery via GradInversion[13]
+
+文章在针对 mini-batch 的问题进行了改进，假设在 1000 分类的 ImageNet 数据集上训练时，每个 mini-batch 里采样得到的样本标签是各不相同的，在这样的假设下通过 iDLG 方法分析可得一个 mini-batch 中存在的标签对应的 $\nabla \mathbf{W}_L^i$ 平均值要小于其他位置，通过这种方式可以找到 mini-batch 中不同的标签。
+
 ## 联邦学习防御
 
 ## 拆分学习基本算法 Split Learning
@@ -167,7 +269,6 @@ $$
 
 其中正则项为全变分（Total Variation）模型，用来保持复原图像的平滑性。
 
-
 ### 恶意客户端攻击
 
 #### GAN-based Gradient Leakage Attack
@@ -202,7 +303,7 @@ $$
 * [chaoyanghe/Awesome-Federated-Learning: FedML - The Research and Production Integrated Federated Learning Library: https://fedml.ai (github.com)](https://github.com/chaoyanghe/Awesome-Federated-Learning)
 * [weimingwill/awesome-federated-learning: All materials you need for Federated Learning: blogs, videos, papers, and softwares, etc. (github.com)](https://github.com/weimingwill/awesome-federated-learning)
 * [innovation-cat/Awesome-Federated-Machine-Learning: Everything about federated learning, including research papers, books, codes, tutorials, videos and beyond (github.com)](https://github.com/innovation-cat/Awesome-Federated-Machine-Learning)
-* [google-research/federated: A collection of Google research projects related to Federated Learning and Federated Analytics. (github.com)](https://github.com/google-research/federated)   [Google Fedrated Learning implement]
+* [google-research/federated: A collection of Google research projects related to Federated Learning and Federated Analytics. (github.com)](https://github.com/google-research/federated)   [Google Federated Learning Implement]
 
 ## Reference
 
@@ -225,4 +326,10 @@ $$
 [9] [ResSFL: A Resistance Transfer Framework for Defending Model Inversion Attack in Split Federated Learning](https://arxiv.org/abs/2205.04007)
 
 [10] [Querying Little Is Enough: Model inversion attack via latent information](https://link.springer.com/chapter/10.1007/978-3-030-62460-6_52)
+
+[11] [Deep Leakage from Gradient](https://arxiv.org/abs/1906.08935)
+
+[12] [iDLG: Improved Deep Leakage from Gradients](https://arxiv.org/abs/2001.02610)
+
+[13] [See through Gradients: Image Batch Recovery via GradInversion](https://arxiv.org/abs/2104.07586)
 
